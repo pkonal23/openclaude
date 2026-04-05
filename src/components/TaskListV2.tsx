@@ -240,6 +240,24 @@ function getTaskIcon(status: Task['status']): {
       };
   }
 }
+
+function TaskTimer({ startedAt, isInProgress }: { startedAt?: number, isInProgress: boolean }) {
+  const [now, setNow] = React.useState(Date.now());
+  React.useEffect(() => {
+    if (!startedAt || !isInProgress) return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [startedAt, isInProgress]);
+
+  if (!startedAt || !isInProgress) return null;
+  const totalMs = Math.max(0, now - startedAt);
+  const totalS = Math.floor(totalMs / 1000);
+  const m = Math.floor(totalS / 60);
+  const s = String(totalS % 60).padStart(2, '0');
+  const formatted = m > 0 ? `${m}m ${s}s` : `${s}s`;
+  
+  return <Text dimColor> ({formatted})</Text>;
+}
 function TaskItem(t0) {
   const $ = _c(37);
   const {
@@ -339,16 +357,18 @@ function TaskItem(t0) {
   } else {
     t9 = $[25];
   }
+  let tTimer = <TaskTimer startedAt={task.startedAt} isInProgress={isInProgress} />;
   let t10;
-  if ($[26] !== t5 || $[27] !== t7 || $[28] !== t8 || $[29] !== t9) {
-    t10 = <FullWidthRow>{t5}{t7}{t8}{t9}</FullWidthRow>;
+  if ($[26] !== t5 || $[27] !== t7 || $[28] !== t8 || $[29] !== t9 || $[30] !== tTimer) {
+    t10 = <FullWidthRow>{t5}{t7}{t8}{t9}{tTimer}</FullWidthRow>;
     $[26] = t5;
     $[27] = t7;
     $[28] = t8;
     $[29] = t9;
-    $[30] = t10;
+    $[30] = tTimer;
+    $["_t10"] = t10;
   } else {
-    t10 = $[30];
+    t10 = $["_t10"];
   }
   let t11;
   if ($[31] !== displayActivity || $[32] !== showActivity) {

@@ -84,6 +84,7 @@ export const TaskSchema = lazySchema(() =>
     blocks: z.array(z.string()), // task IDs this task blocks
     blockedBy: z.array(z.string()), // task IDs that block this task
     metadata: z.record(z.string(), z.unknown()).optional(), // arbitrary metadata
+    startedAt: z.number().optional(), // timestamp when task entered in_progress
   }),
 )
 export type Task = z.infer<ReturnType<typeof TaskSchema>>
@@ -361,6 +362,11 @@ async function updateTaskUnsafe(
     return null
   }
   const updated: Task = { ...existing, ...updates, id: taskId }
+  if (updates.status === 'in_progress' && existing.status !== 'in_progress' && !updated.startedAt) {
+    updated.startedAt = Date.now()
+  } else if (updates.status === 'pending') {
+    updated.startedAt = undefined // clear if moved back to pending
+  }
   const path = getTaskPath(taskListId, taskId)
   await writeFile(path, jsonStringify(updated, null, 2))
   notifyTasksUpdated()
