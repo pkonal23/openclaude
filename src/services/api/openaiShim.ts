@@ -673,6 +673,7 @@ function convertChunkUsage(
 async function* openaiStreamToAnthropic(
   response: Response,
   model: string,
+  validToolNames?: Set<string>,
 ): AsyncGenerator<AnthropicStreamEvent> {
   const messageId = makeMessageId()
   let contentBlockIndex = 0
@@ -747,8 +748,8 @@ async function* openaiStreamToAnthropic(
           if (isGemmaStream) {
             if (inGemmaCall) {
               streamingContentBuffer += delta.content
-              continue
-            }
+              // Don't continue — fall through so finish_reason in the same chunk is processed
+            } else {
 
             gemmaStreamBuffer += delta.content
             streamingContentBuffer += delta.content
@@ -773,12 +774,11 @@ async function* openaiStreamToAnthropic(
                     gemmaThinkingOpen = true
                  }
                  gemmaStarted = true
-              } else {
-                 continue
               }
+              // If not started yet, skip yielding but don't continue — let finish_reason process
             }
 
-            if (gemmaStreamBuffer.includes('call:')) {
+            if (gemmaStarted && gemmaStreamBuffer.includes('call:')) {
                inGemmaCall = true
                const beforeCall = gemmaStreamBuffer.split('call:')[0]
                if (beforeCall) {
@@ -798,8 +798,8 @@ async function* openaiStreamToAnthropic(
                    delta: { type: 'text_delta', text: yieldText },
                  }
                }
-               continue
-            }
+               // Don't continue — fall through so finish_reason in the same chunk is processed
+            } else if (gemmaStarted) {
 
             const matchIndex = gemmaStreamBuffer.search(/c(?:a(?:l(?:l(?::)?)?)?)?$/)
             let toYield = ''
@@ -809,10 +809,9 @@ async function* openaiStreamToAnthropic(
             } else if (matchIndex > 0) {
               toYield = gemmaStreamBuffer.substring(0, matchIndex)
               gemmaStreamBuffer = gemmaStreamBuffer.substring(matchIndex)
-            } else {
-              continue
             }
             
+            if (toYield) {
             if (!hasEmittedContentStart) {
                yield {
                  type: 'content_block_start',
@@ -826,8 +825,11 @@ async function* openaiStreamToAnthropic(
               index: contentBlockIndex,
               delta: { type: 'text_delta', text: toYield },
             }
-            continue
-          }
+            }
+            // Don't continue — fall through so finish_reason in the same chunk is processed
+            }
+            } // end else (not inGemmaCall)
+          } else {
 
           streamingContentBuffer += delta.content
 
@@ -844,6 +846,7 @@ async function* openaiStreamToAnthropic(
             index: contentBlockIndex,
             delta: { type: 'text_delta', text: delta.content },
           }
+          } // end else (non-Gemma)
         }
 
         // Tool calls
@@ -940,7 +943,11 @@ async function* openaiStreamToAnthropic(
           // If no structured tool_calls arrived but content contains call:func{...},
           // emit synthetic tool_use content blocks now.
           if (isGemmaStream && activeToolCalls.size === 0 && streamingContentBuffer.includes('call:')) {
-            const { calls } = extractGemma4ToolCalls(streamingContentBuffer)
+            const { calls: rawCalls } = extractGemma4ToolCalls(streamingContentBuffer)
+            // Filter to only calls whose name matches an actual available tool
+            const calls = validToolNames
+              ? rawCalls.filter(c => validToolNames.has(c.name))
+              : rawCalls
             if (calls.length > 0) {
               if (hasEmittedContentStart) {
                 // We no longer need to emit `cleanedContent` because we safely 
@@ -1120,11 +1127,16 @@ class OpenAIShimMessages {
       const response = await self._doRequest(request, params, options)
       httpResponse = response
 
+      // Build a set of valid tool names for Gemma tool-call validation
+      const toolNames = params.tools && Array.isArray(params.tools)
+        ? new Set((params.tools as Array<{ name: string }>).map(t => t.name))
+        : undefined
+
       if (params.stream) {
         return new OpenAIShimStream(
           request.transport === 'codex_responses'
             ? codexStreamToAnthropic(response, request.resolvedModel)
-            : openaiStreamToAnthropic(response, request.resolvedModel),
+            : openaiStreamToAnthropic(response, request.resolvedModel, toolNames),
         )
       }
 
@@ -1137,7 +1149,7 @@ class OpenAIShimMessages {
       }
 
       const data = await response.json()
-      return self._convertNonStreamingResponse(data, request.resolvedModel)
+      return self._convertNonStreamingResponse(data, request.resolvedModel, toolNames)
     })()
 
       ; (promise as unknown as Record<string, unknown>).withResponse =
@@ -1406,6 +1418,7 @@ class OpenAIShimMessages {
       }
     },
     model: string,
+    validToolNames?: Set<string>,
   ) {
     const choice = data.choices?.[0]
     const content: Array<Record<string, unknown>> = []
@@ -1422,7 +1435,13 @@ class OpenAIShimMessages {
       function: { name: string; arguments: string }
     }> = []
     if (model.toLowerCase().includes('gemma') && existingToolCalls.length === 0 && typeof rawContent === 'string' && rawContent.includes('call:')) {
-      const { calls, cleanedContent } = extractGemma4ToolCalls(rawContent)
+      const { calls: rawCalls, cleanedContent } = extractGemma4ToolCalls(rawContent)
+      // Filter to only calls whose name matches an actual available tool.
+      // This prevents explanatory text like "here is an example: call:Write{...}"
+      // from being misinterpreted as a genuine tool invocation.
+      const calls = validToolNames
+        ? rawCalls.filter(c => validToolNames.has(c.name))
+        : rawCalls
       if (calls.length > 0) {
         gemma4ToolCalls = calls.map(c => ({
           id: makeToolId(),

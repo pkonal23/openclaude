@@ -573,3 +573,137 @@ test('sanitizes malformed MCP tool schemas before sending them to OpenAI', async
   expect(properties?.priority?.enum).toEqual([0, 1, 2, 3])
   expect(properties?.priority).not.toHaveProperty('default')
 })
+
+test('non-streaming Gemma: explanatory call: text is NOT converted to tool_use when function name is unknown', async () => {
+  globalThis.fetch = (async (_input, _init) => {
+    return new Response(
+      JSON.stringify({
+        id: 'chatcmpl-gemma-1',
+        model: 'gemma-4-27b-it',
+        choices: [
+          {
+            message: {
+              role: 'assistant',
+              // Gemma is explaining the syntax, NOT requesting a tool call
+              content:
+                'Here is the syntax example:\ncall:Write{file_path:a.txt,content:hello}\nDo not execute it.',
+              tool_calls: [],
+            },
+            finish_reason: 'stop',
+          },
+        ],
+        usage: {
+          prompt_tokens: 20,
+          completion_tokens: 30,
+          total_tokens: 50,
+        },
+      }),
+      {
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      },
+    )
+  }) as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+
+  const result = (await client.beta.messages.create({
+    model: 'gemma-4-27b-it',
+    system: 'test system',
+    messages: [{ role: 'user', content: 'Show me the tool call syntax' }],
+    // Only Bash and Read are available — NOT Write
+    tools: [
+      { name: 'Bash', description: 'Run a bash command', input_schema: { type: 'object', properties: { command: { type: 'string' } } } },
+      { name: 'Read', description: 'Read a file', input_schema: { type: 'object', properties: { file_path: { type: 'string' } } } },
+    ],
+    max_tokens: 128,
+    stream: false,
+  })) as { content: Array<{ type: string; text?: string }> }
+
+  // The response should be plain text — no tool_use blocks
+  const toolUseBlocks = result.content.filter(b => b.type === 'tool_use')
+  expect(toolUseBlocks.length).toBe(0)
+
+  // The text content should still be present
+  const textBlocks = result.content.filter(b => b.type === 'text')
+  expect(textBlocks.length).toBeGreaterThan(0)
+})
+
+test('streaming Gemma: tool call is NOT dropped when delta.content and finish_reason arrive in the same chunk', async () => {
+  globalThis.fetch = (async (_input, _init) => {
+    const chunks = makeStreamChunks([
+      // First chunk: thinking text
+      {
+        id: 'chatcmpl-gemma-2',
+        object: 'chat.completion.chunk',
+        model: 'gemma-4-27b-it',
+        choices: [
+          {
+            index: 0,
+            delta: { role: 'assistant', content: 'thought\nLet me write that file.\n' },
+            finish_reason: null,
+          },
+        ],
+      },
+      // Final chunk: tool call AND finish_reason in the SAME chunk
+      {
+        id: 'chatcmpl-gemma-2',
+        object: 'chat.completion.chunk',
+        model: 'gemma-4-27b-it',
+        choices: [
+          {
+            index: 0,
+            delta: { content: 'call:Bash{command:"echo hello"}' },
+            finish_reason: 'stop',
+          },
+        ],
+      },
+    ])
+
+    return makeSseResponse(chunks)
+  }) as FetchType
+
+  const client = createOpenAIShimClient({}) as OpenAIShimClient
+
+  const result = await client.beta.messages
+    .create({
+      model: 'gemma-4-27b-it',
+      system: 'test system',
+      messages: [{ role: 'user', content: 'echo hello' }],
+      tools: [
+        { name: 'Bash', description: 'Run a bash command', input_schema: { type: 'object', properties: { command: { type: 'string' } } } },
+      ],
+      max_tokens: 64,
+      stream: true,
+    })
+    .withResponse()
+
+  const events: Array<Record<string, unknown>> = []
+  for await (const event of result.data) {
+    events.push(event)
+  }
+
+  // There should be a synthetic tool_use content_block_start
+  const toolStart = events.find(
+    event =>
+      event.type === 'content_block_start' &&
+      typeof event.content_block === 'object' &&
+      event.content_block !== null &&
+      (event.content_block as Record<string, unknown>).type === 'tool_use',
+  ) as { content_block?: Record<string, unknown> } | undefined
+
+  expect(toolStart).toBeDefined()
+  expect(toolStart?.content_block?.name).toBe('Bash')
+
+  // There should be a message_delta with stop_reason = 'tool_use'
+  const stopEvent = events.find(
+    event =>
+      event.type === 'message_delta' &&
+      typeof event.delta === 'object' &&
+      event.delta !== null &&
+      (event.delta as Record<string, unknown>).stop_reason === 'tool_use',
+  )
+
+  expect(stopEvent).toBeDefined()
+})
